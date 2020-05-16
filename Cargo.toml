@@ -1,0 +1,12 @@
+[package]
+name = "lprofile-rs"
+version = "0.1.0"
+authors = ["Fingercomp <fingercomp@fomalhaut.me>"]
+edition = "2018"
+
+[lib]
+name = "lprofile_hook"
+crate-type = ["dylib"]
+
+[dependencies]
+lua = "0.0.10"
