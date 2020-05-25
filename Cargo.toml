@@ -10,3 +10,4 @@ crate-type = ["dylib"]
 
 [dependencies]
 lua = "0.0.10"
+once_cell = "1.4.0"
