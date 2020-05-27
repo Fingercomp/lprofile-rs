@@ -159,7 +159,7 @@ impl CallFrame {
     }
 
     fn close(&self, result: &mut ProfilingResult) {
-        assert!(!self.suspended, "attempted to close a suspended call frame");
+        debug_assert!(!self.suspended, "attempted to close a suspended call frame");
 
         let entry = result.data.get_mut(&self.key).unwrap();
         entry.total_self_time += self.inner_start.elapsed();
@@ -172,7 +172,7 @@ impl CallFrame {
     }
 
     fn suspend(&mut self, result: &mut ProfilingResult) {
-        assert!(!self.suspended, "the call frame is already suspended");
+        debug_assert!(!self.suspended, "the call frame is already suspended");
 
         let entry = result.data.get_mut(&self.key).unwrap();
         entry.total_self_time += self.inner_start.elapsed();
@@ -421,7 +421,7 @@ impl Profiler {
         let key = unsafe { FunctionKey::from_ar(state, ar).unwrap() };
         let level = Self::get_stack_level(state);
 
-        assert!(Self::get_from_registry(state));
+        Self::get_from_registry(state);
         // Safety: the check above
         let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
         let this: &mut Self = &mut **this;
@@ -464,7 +464,7 @@ impl Profiler {
         // Safety: the activation record is passed to the hook
         let level = Self::get_stack_level(state);
 
-        assert!(Self::get_from_registry(state));
+        Self::get_from_registry(state);
         // Safety: the check above
         let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
         this.set_stack_to(level);
