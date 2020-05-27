@@ -10,39 +10,6 @@ use lua::ffi::{lua_Debug, self};
 use lua::libc::c_int;
 use once_cell::sync::Lazy;
 
-macro_rules! __fill_table {
-    ($state:expr; $key:expr => |$s:ident| $value:expr, $( $tail:tt )*) => {
-        let $s = &mut *$state;
-        $s.push($key);
-        $value;
-        $s.set_table(-3);
-
-        __fill_table!($s, $( $tail )*);
-    };
-
-    ($state:expr; $key:expr => |$s:ident| $value:expr) => {
-        __fill_table!($state, $key => |$s| $value,);
-    };
-
-    ($state:expr;) => ();
-}
-
-macro_rules! __count_fields {
-    ($key:expr => |$state:ident| $value:expr, $( $tail:tt )*) => (1 + __count_fields!($( $tail )*));
-    ($key:expr => |$state:ident| $value:expr) => (__count_fields!($key => $value));
-    () => (0);
-}
-
-macro_rules! table {
-    ($state:expr; $( $fields:tt )*) => {{
-        let count = __count_fields!($( $fields )*);
-        $state.create_table(0, count);
-        __fill_table!($state, $( $fields )*);
-    }};
-
-    ($state:expr;) => (table!($state,));
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FunctionKey(usize);
 
@@ -191,55 +158,48 @@ impl CallFrame {
 
 struct ProfilingResult {
     data: HashMap<FunctionKey, ProfileEntry>,
+    total_time: Option<Duration>,
 }
 
 impl ProfilingResult {
-    const TYPE_NAME: &'static str = "ProfilingResult";
-
     fn new() -> Self {
         Self {
             data: HashMap::new(),
+            total_time: None,
         }
     }
 
     fn move_to_lua(self, state: &mut State) -> i32 {
-        static METATABLE: Once = Once::new();
+        let len = self.data.len() as i32;
+        state.create_table(len, 1);
 
-        METATABLE.call_once(|| {
-            state.new_metatable(Self::TYPE_NAME);
-            state.set_fns(&[
-                ("__index", lua_func!(Self::index)),
-                ("__gc", lua_func!(Self::gc)),
-            ], 0);
-        });
+        for (i, v) in self.data.values().enumerate() {
+            state.create_table(0, 4);
 
-        // Safety: guaranteed by Lua
-        unsafe {
-            *state.new_userdata_typed() = ManuallyDrop::new(self);
+            state.push("name");
+            state.push(v.name.as_ref().map_or_else(String::new, |v| v.to_string()));
+            state.set_table(-3);
+
+            state.push("calls");
+            state.push(v.calls as i64);
+            state.set_table(-3);
+
+            state.push("totalTime");
+            state.push(v.total_time.as_secs_f64());
+            state.set_table(-3);
+
+            state.push("totalSelfTime");
+            state.push(v.total_self_time.as_secs_f64());
+            state.set_table(-3);
+
+            state.seti(-2, (i + 1) as i64);
         }
 
-        state.set_metatable_from_registry(Self::TYPE_NAME);
+        state.push("totalTime");
+        state.push(self.total_time.map(|v| v.as_secs_f64()));
+        state.set_table(-3);
 
         1
-    }
-
-    fn index(state: &mut State) -> i32 {
-        0
-    }
-
-    fn gc(state: &mut State) -> i32 {
-        unsafe {
-            // Safety: guaranteed by Lua (technically there's debug.getmetatable, but I'm not
-            // concerned with that).
-            let this: &mut ManuallyDrop<Self> = state.check_userdata_typed(1, Self::TYPE_NAME);
-
-            // Safety: gc is guaranteed to be called only once; also see above.
-            ManuallyDrop::drop(this);
-        }
-
-        state.pop(1);
-
-        0
     }
 }
 
@@ -300,7 +260,10 @@ impl Profiler {
         state.rotate(1, 1);
         state.raw_setp(lua::REGISTRYINDEX, Self::OPAQUE_REGISTRY_KEY);
 
+        let start = Instant::now();
         let status = state.pcall(0, 0, 0);
+        let total_time = start.elapsed();
+
         Self::unset_hook(state, prev_hook);
 
         if status.is_err() {
@@ -312,10 +275,9 @@ impl Profiler {
 
         // Safety: the registry is not modified during profiling
         let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
-        let result = this.result.take().unwrap();
-        result.move_to_lua(state);
-
-        1
+        let mut result = this.result.take().unwrap();
+        result.total_time = Some(total_time);
+        result.move_to_lua(state)
     }
 
     fn get_from_registry(state: &mut State) -> bool {
@@ -415,8 +377,8 @@ impl Profiler {
 
         assert!(Self::get_from_registry(state));
         // Safety: the check above
-        let this: &mut Self = unsafe { state.to_userdata_typed(-1).unwrap() };
-        this.set_stack_to(level);
+        let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
+        let this: &mut Self = &mut **this;
 
         let last = this.stack.last_mut().unwrap();
         last.suspend(this.result.as_mut().unwrap());
@@ -433,7 +395,7 @@ impl Profiler {
             Self::determine_name_for(state, ar)
         } else { None };
 
-        let this: &mut Self = unsafe { state.to_userdata_typed(-1).unwrap() };
+        let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
         let entry = this.result.as_mut().unwrap().data.get_mut(&key).unwrap();
         entry.name = name;
 
@@ -447,7 +409,7 @@ impl Profiler {
 
         assert!(Self::get_from_registry(state));
         // Safety: the check above
-        let this: &mut Self = unsafe { state.to_userdata_typed(-1).unwrap() };
+        let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
         this.set_stack_to(level);
 
         while let Some(frame) = this.stack.last() {
