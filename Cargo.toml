@@ -9,5 +9,5 @@ name = "lprofile_hook"
 crate-type = ["dylib"]
 
 [dependencies]
-lua = "0.0.10"
 once_cell = "1.4.0"
+lua = { path = "../rust-lua53" }

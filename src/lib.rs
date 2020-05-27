@@ -5,9 +5,9 @@ use std::mem::ManuallyDrop;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use lua::{lua_func, State, Function, Hook, HookMask};
-use lua::ffi::{lua_Debug, self};
+use lua::ffi::{self, lua_Debug};
 use lua::libc::c_int;
+use lua::{lua_func, Function, Hook, HookMask, State};
 use once_cell::sync::Lazy;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -21,7 +21,7 @@ impl FunctionKey {
         match ffi::lua_getinfo(state.as_ptr(), what.as_ptr(), ar) {
             0 => None,
             _ => {
-                let addr = state.to_pointer(1) as usize;
+                let addr = state.to_pointer(-1) as usize;
                 state.pop(1);
 
                 Some(Self(addr))
@@ -30,11 +30,12 @@ impl FunctionKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FunctionName {
     name: Option<String>,
     function_type: Option<String>,
     source: String,
-    line: usize,
+    line: Option<usize>,
     // Lua function / C function / main chunk
     domain: String,
 }
@@ -55,8 +56,17 @@ impl FunctionName {
             Some(function_type)
         };
 
-        let source = CStr::from_ptr(&ar.short_src as *const lua::libc::c_char).to_string_lossy().into_owned();
-        let line = ar.linedefined as usize;
+        let source = CStr::from_ptr(&ar.short_src as *const lua::libc::c_char)
+            .to_string_lossy()
+            .into_owned();
+
+        let line = ar.linedefined;
+        let line = if line == -1 {
+            None
+        } else {
+            Some(line as usize)
+        };
+
         let domain = CStr::from_ptr(ar.what).to_str().unwrap().to_owned();
 
         Self {
@@ -72,7 +82,13 @@ impl FunctionName {
 impl Display for FunctionName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.domain == "main" {
-            write!(f, "main chunk of {} ({}:{})", self.source, self.source, self.line)
+            write!(f, "main chunk of {} ({}", self.source, self.source)?;
+
+            if let Some(line) = self.line {
+                write!(f, ":{}", line)?;
+            }
+
+            write!(f, ")")
         } else {
             if self.name.is_none() {
                 write!(f, "anonymous ")?;
@@ -90,16 +106,24 @@ impl Display for FunctionName {
                 write!(f, "function ")?;
             }
 
-            write!(f, "({}:{})", self.source, self.line)
+            write!(f, "({}", self.source)?;
+
+            if let Some(line) = self.line {
+                write!(f, ":{}", line)?;
+            }
+
+            write!(f, ")")
         }
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ProfileEntry {
     calls: usize,
     total_time: Duration,
     total_self_time: Duration,
     name: Option<FunctionName>,
+    recursion_depth: usize,
 }
 
 impl ProfileEntry {
@@ -109,10 +133,12 @@ impl ProfileEntry {
             total_time: Duration::new(0, 0),
             total_self_time: Duration::new(0, 0),
             name,
+            recursion_depth: 1,
         }
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CallFrame {
     entry: Instant,
     inner_start: Instant,
@@ -136,11 +162,18 @@ impl CallFrame {
         assert!(!self.suspended, "attempted to close a suspended call frame");
 
         let entry = result.data.get_mut(&self.key).unwrap();
-        entry.total_time += self.entry.elapsed();
         entry.total_self_time += self.inner_start.elapsed();
+
+        entry.recursion_depth -= 1;
+
+        if entry.recursion_depth == 0 {
+            entry.total_time += self.entry.elapsed();
+        }
     }
 
     fn suspend(&mut self, result: &mut ProfilingResult) {
+        assert!(!self.suspended, "the call frame is already suspended");
+
         let entry = result.data.get_mut(&self.key).unwrap();
         entry.total_self_time += self.inner_start.elapsed();
         self.suspended = true;
@@ -156,6 +189,7 @@ impl CallFrame {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ProfilingResult {
     data: HashMap<FunctionKey, ProfileEntry>,
     total_time: Option<Duration>,
@@ -203,6 +237,7 @@ impl ProfilingResult {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Profiler {
     result: Option<ProfilingResult>,
     stack: Vec<CallFrame>,
@@ -217,10 +252,13 @@ impl Profiler {
 
         METATABLE.call_once(|| {
             state.new_metatable(Self::TYPE_NAME);
-            state.set_fns(&[
-                ("__call", lua_func!(Self::call)),
-                ("__gc", lua_func!(Self::gc)),
-            ], 0);
+            state.set_fns(
+                &[
+                    ("__call", lua_func!(Self::call)),
+                    ("__gc", lua_func!(Self::gc)),
+                ],
+                0,
+            );
         });
 
         // Safety: guaranteed by Lua.
@@ -238,16 +276,14 @@ impl Profiler {
 
     fn call(state: &mut State) -> i32 {
         // check but don't use, since we need state later
+        state.set_top(2);
         state.check_userdata(1, Self::TYPE_NAME);
         state.check_type(2, lua::Type::Function);
-        state.set_top(2);
 
         if Self::get_from_registry(state) {
             state.push("attempt to run multiple profiling sessions simulatenously");
             state.error();
         }
-
-        let prev_hook = Self::set_hook(state);
 
         // Safety: checked above; set_hook does not modify the stack.
         let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(1).unwrap() };
@@ -259,6 +295,8 @@ impl Profiler {
         // Self f      f Self
         state.rotate(1, 1);
         state.raw_setp(lua::REGISTRYINDEX, Self::OPAQUE_REGISTRY_KEY);
+
+        let prev_hook = Self::set_hook(state);
 
         let start = Instant::now();
         let status = state.pcall(0, 0, 0);
@@ -281,12 +319,16 @@ impl Profiler {
     }
 
     fn get_from_registry(state: &mut State) -> bool {
-        match state.raw_getp(lua::REGISTRYINDEX, Self::OPAQUE_REGISTRY_KEY) {
-            lua::Type::Userdata => {
-                !state.test_userdata(-1, Self::TYPE_NAME).is_null()
-            }
+        let result = match state.raw_getp(lua::REGISTRYINDEX, Self::OPAQUE_REGISTRY_KEY) {
+            lua::Type::Userdata => !state.test_userdata(-1, Self::TYPE_NAME).is_null(),
             _ => false,
+        };
+
+        if !result {
+            state.pop(1);
         }
+
+        result
     }
 
     fn gc(state: &mut State) -> i32 {
@@ -302,7 +344,11 @@ impl Profiler {
     }
 
     fn set_hook(state: &mut State) -> (Hook, HookMask, c_int) {
-        let prev = (state.get_hook(), state.get_hook_mask(), state.get_hook_count());
+        let prev = (
+            state.get_hook(),
+            state.get_hook_mask(),
+            state.get_hook_count(),
+        );
 
         let mut mask = HookMask::empty();
         mask.insert(lua::MASKRET);
@@ -380,24 +426,35 @@ impl Profiler {
         let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
         let this: &mut Self = &mut **this;
 
-        let last = this.stack.last_mut().unwrap();
-        last.suspend(this.result.as_mut().unwrap());
+        if let Some(last) = this.stack.last_mut() {
+            last.suspend(this.result.as_mut().unwrap());
+        }
 
-        let entry = this.result.as_mut().unwrap().data.entry(key)
+        let entry = this
+            .result
+            .as_mut()
+            .unwrap()
+            .data
+            .entry(key)
             .and_modify(|entry| {
                 entry.calls += 1;
+
+                entry.recursion_depth += 1;
             })
-            .or_insert_with(|| {
-                ProfileEntry::new(None)
-            });
+            .or_insert_with(|| ProfileEntry::new(None));
 
         let name = if entry.name.is_none() {
             Self::determine_name_for(state, ar)
-        } else { None };
+        } else {
+            None
+        };
 
         let this: &mut ManuallyDrop<Self> = unsafe { state.to_userdata_typed(-1).unwrap() };
         let entry = this.result.as_mut().unwrap().data.get_mut(&key).unwrap();
-        entry.name = name;
+
+        if name.is_some() {
+            entry.name = name;
+        }
 
         let frame = CallFrame::new(level, key);
         this.stack.push(frame);
@@ -421,14 +478,15 @@ impl Profiler {
             frame.resume();
             frame.close(this.result.as_mut().unwrap());
         }
+
+        if let Some(last) = this.stack.last_mut() {
+            last.resume();
+        }
     }
 }
 
-static LIBRARY: Lazy<Box<[(&str, Function)]>> = Lazy::new(|| {
-    Box::new([
-        ("Profiler", lua_func!(Profiler::new)),
-    ])
-});
+static LIBRARY: Lazy<Box<[(&str, Function)]>> =
+    Lazy::new(|| Box::new([("Profiler", lua_func!(Profiler::new))]));
 
 // Safety: must only be called using Lua's require.
 #[no_mangle]
