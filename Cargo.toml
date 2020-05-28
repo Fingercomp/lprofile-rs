@@ -3,9 +3,15 @@ name = "lprofile-rs"
 version = "0.1.0"
 authors = ["Fingercomp <fingercomp@fomalhaut.me>"]
 edition = "2018"
+description = "A Lua 5.3 profiler module"
+readme = "README.md"
+repository = "https://github.com/Fingercomp/lprofile-rs"
+license = "Apache-2.0"
+keywords = ["lua", "module", "profiler", "lua-53"]
+publish = false
 
 [lib]
-name = "lprofile_hook"
+name = "lprofile"
 crate-type = ["dylib"]
 
 [dependencies]

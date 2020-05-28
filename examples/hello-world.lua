@@ -1,4 +1,4 @@
-local profiler = require("liblprofile_hook").Profiler()
+local profiler = require("liblprofile").Profiler()
 
 local g
 
