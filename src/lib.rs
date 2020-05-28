@@ -490,7 +490,7 @@ static LIBRARY: Lazy<Box<[(&str, Function)]>> =
 
 // Safety: must only be called using Lua's require.
 #[no_mangle]
-pub unsafe extern "C" fn luaopen_liblprofile_hook(state: *mut ffi::lua_State) -> c_int {
+pub unsafe extern "C" fn luaopen_liblprofile(state: *mut ffi::lua_State) -> c_int {
     let mut state = lua::State::from_ptr(state);
     state.new_lib(&LIBRARY);
 
