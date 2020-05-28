@@ -1,0 +1,3 @@
+[submodule "rust-lua53"]
+	path = rust-lua53
+	url = https://github.com/Fingercomp/rust-lua53.git
